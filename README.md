@@ -48,10 +48,6 @@ curl https://www.google.com
 ### Docker
 
 ```bash
-# Using Docker
-docker run -d -p 8881:8881 -p 8882:8882 \
-  ghcr.io/user-for-download/tls-fragment-proxy:latest
-
 # Or build locally
 docker build -t tls-fragment-proxy .
 docker run -d -p 8881:8881 -p 8882:8882 tls-fragment-proxy
@@ -98,19 +94,6 @@ This approach is effective because many DPI systems:
 - Only inspect the first few packets
 - Have limited buffer space for reassembly
 - Fail to handle fragmented SNI fields correctly
-
-### Fragmentation Algorithm
-
-```rust
-// Simplified fragmentation logic
-if let Some(sni_position) = find_sni_boundary(tls_data) {
-    // Fragment at SNI boundary (most effective)
-    fragment_at(sni_position)
-} else {
-    // Random fragmentation as fallback
-    random_fragment(tls_data)
-}
-```
 
 ## 🌐 Client Configuration
 
@@ -337,29 +320,6 @@ journalctl -f | grep tls-fragment
 ss -tnp | grep 8881
 ```
 
-## 📈 Performance Tuning
-
-### System Optimization (Linux)
-
-```bash
-# Increase file descriptors
-echo "* soft nofile 65535" | sudo tee -a /etc/security/limits.conf
-echo "* hard nofile 65535" | sudo tee -a /etc/security/limits.conf
-
-# Optimize network stack
-sudo sysctl -w net.core.somaxconn=65535
-sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
-sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
-```
-
-### Proxy Optimization
-
-For high-traffic scenarios:
-```bash
-./tls-fragment-proxy \
-  --max-connections 10000 \
-  --rate-limit-per-second 5000
-```
 
 ## 🏗️ Building from Source
 
