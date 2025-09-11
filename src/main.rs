@@ -16,11 +16,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::time::{interval, timeout, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, trace};
 use tracing::Level;
 
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "1.0.1";
 const BUFFER_SIZE: usize = 65536;
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Error, Debug)]
 enum ProxyError {
@@ -37,15 +39,27 @@ enum ProxyError {
     RateLimited,
 }
 
+// Check if error is expected/normal
+fn is_expected_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset |
+        ErrorKind::ConnectionAborted |
+        ErrorKind::BrokenPipe |
+        ErrorKind::UnexpectedEof
+    )
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tls-fragment-proxy")]
 #[command(version = VERSION)]
 #[command(about = "HTTP/HTTPS proxy with TLS fragmentation")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
-    #[arg(long, default_value_t = 8881)]
+    #[arg(long, default_value_t = 8888)]
     port: u16,
 
     #[arg(long, default_value = "blacklist.txt")]
@@ -75,6 +89,7 @@ struct Stats {
     whitelisted_connections: Arc<AtomicUsize>,
     failed_connections: Arc<AtomicUsize>,
     rate_limited_connections: Arc<AtomicUsize>,
+    client_disconnects: Arc<AtomicUsize>,
     traffic_in: Arc<AtomicU64>,
     traffic_out: Arc<AtomicU64>,
 }
@@ -88,8 +103,25 @@ impl Stats {
             whitelisted_connections: Arc::new(AtomicUsize::new(0)),
             failed_connections: Arc::new(AtomicUsize::new(0)),
             rate_limited_connections: Arc::new(AtomicUsize::new(0)),
+            client_disconnects: Arc::new(AtomicUsize::new(0)),
             traffic_in: Arc::new(AtomicU64::new(0)),
             traffic_out: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn log_stats(&self) {
+        let active = self.active_connections.load(Ordering::Relaxed);
+        let total = self.total_connections.load(Ordering::Relaxed);
+        let fragmented = self.fragmented_connections.load(Ordering::Relaxed);
+
+        if total > 0 && total % 100 == 0 {
+            info!(
+                "Stats: Active={}, Total={}, Fragmented={}, Disconnects={}",
+                active,
+                total,
+                fragmented,
+                self.client_disconnects.load(Ordering::Relaxed)
+            );
         }
     }
 }
@@ -111,7 +143,7 @@ impl RateLimiter {
             limits: Arc::new(DashMap::new()),
             max_per_second,
         };
-        
+
         // Cleanup task
         let limits_clone = Arc::clone(&limiter.limits);
         tokio::spawn(async move {
@@ -128,7 +160,7 @@ impl RateLimiter {
                 });
             }
         });
-        
+
         limiter
     }
 
@@ -138,16 +170,16 @@ impl RateLimiter {
                 tokens: self.max_per_second,
                 last_refill: Instant::now(),
             })));
-        
+
         let mut entry = entry.lock().await;
         let now = Instant::now();
         let elapsed = now.duration_since(entry.last_refill);
-        
+
         if elapsed >= Duration::from_secs(1) {
             entry.tokens = self.max_per_second;
             entry.last_refill = now;
         }
-        
+
         if entry.tokens > 0 {
             entry.tokens -= 1;
             true
@@ -210,11 +242,11 @@ impl DomainFilter {
     fn is_whitelisted(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
         let whitelist = self.whitelist.read();
-        
+
         if whitelist.contains(&domain_lower) {
             return true;
         }
-        
+
         // Check subdomain matching
         for whitelisted in whitelist.iter() {
             if whitelisted.starts_with("*.") {
@@ -224,18 +256,18 @@ impl DomainFilter {
                 }
             }
         }
-        
+
         false
     }
 
     fn is_blacklisted(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
         let blacklist = self.blacklist.read();
-        
+
         if blacklist.contains(&domain_lower) {
             return true;
         }
-        
+
         // Check subdomain matching
         for blacklisted in blacklist.iter() {
             if blacklisted.starts_with("*.") {
@@ -245,7 +277,7 @@ impl DomainFilter {
                 }
             }
         }
-        
+
         false
     }
 }
@@ -263,19 +295,26 @@ impl ConnectionHandler {
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
+        // Set TCP keepalive
+        let sock_ref = socket2::SockRef::from(&client_stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+
         // Rate limiting
         if let Ok(ip) = client_addr.ip().to_string().parse::<IpAddr>() {
             if !self.rate_limiter.check_rate_limit(ip).await {
                 self.stats.rate_limited_connections.fetch_add(1, Ordering::Relaxed);
-                warn!("Rate limited connection from {}", client_addr);
+                trace!("Rate limited connection from {}", client_addr);
                 return Err(ProxyError::RateLimited.into());
             }
         }
 
         let _permit = self.connection_semaphore.acquire().await?;
-        
+
         self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-        
+
         struct Guard<'a>(&'a AtomicUsize);
         impl<'a> Drop for Guard<'a> {
             fn drop(&mut self) {
@@ -285,25 +324,37 @@ impl ConnectionHandler {
         let _guard = Guard(&self.stats.active_connections);
 
         let mut buffer = vec![0u8; BUFFER_SIZE];
-        
-        let n = match timeout(Duration::from_secs(10), client_stream.read(&mut buffer)).await {
-            Ok(Ok(n)) => n,
+
+        let n = match timeout(CLIENT_TIMEOUT, client_stream.read(&mut buffer)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            Ok(Ok(_)) => {
+                trace!("Client {} closed connection", client_addr);
+                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(Err(e)) if is_expected_error(&e) => {
+                trace!("Client {} disconnected: {}", client_addr, e);
+                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             Ok(Err(e)) => {
-                debug!("Failed to read from client: {}", e);
+                debug!("Failed to read from client {}: {}", client_addr, e);
                 return Err(e.into());
             }
             Err(_) => {
-                debug!("Timeout reading from client");
+                trace!("Timeout reading from client {}", client_addr);
                 return Err(ProxyError::Timeout.into());
             }
         };
 
-        if n == 0 {
-            return Ok(());
-        }
-
         let request_data = &buffer[..n];
-        let (method, host, port) = parse_http_request(request_data)?;
+        let (method, host, port) = match parse_http_request(request_data) {
+            Ok(data) => data,
+            Err(e) => {
+                trace!("Invalid request from {}: {}", client_addr, e);
+                return Err(e);
+            }
+        };
 
         // Check blacklist
         if self.filter.is_blacklisted(&host) {
@@ -317,18 +368,34 @@ impl ConnectionHandler {
         let is_whitelisted = self.filter.is_whitelisted(&host);
         if is_whitelisted {
             self.stats.whitelisted_connections.fetch_add(1, Ordering::Relaxed);
-            info!("Whitelisted domain: {} - bypassing fragmentation", host);
+            debug!("Whitelisted domain: {} - bypassing fragmentation", host);
         }
 
         self.stats.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.stats.log_stats();
 
         let remote_addr = format!("{}:{}", host, port);
-        
-        if method == "CONNECT" {
+
+        trace!("Handling {} request to {} from {}", method, remote_addr, client_addr);
+
+        let result = if method == "CONNECT" {
             self.handle_connect(client_stream, &remote_addr, is_whitelisted).await
         } else {
             self.handle_http(client_stream, &remote_addr, request_data).await
+        };
+
+        if let Err(ref e) = result {
+            match e.downcast_ref::<std::io::Error>() {
+                Some(io_err) if is_expected_error(io_err) => {
+                    trace!("Expected disconnection for {}: {}", remote_addr, io_err);
+                    self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
+
+        result
     }
 
     async fn handle_connect(
@@ -337,16 +404,38 @@ impl ConnectionHandler {
         remote_addr: &str,
         is_whitelisted: bool,
     ) -> Result<()> {
-        let remote_stream = match timeout(Duration::from_secs(5), TcpStream::connect(remote_addr)).await {
+        let remote_stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(remote_addr)).await {
             Ok(Ok(stream)) => stream,
-            _ => {
+            Ok(Err(e)) => {
+                debug!("Failed to connect to {}: {}", remote_addr, e);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(ProxyError::Connection(format!("Failed to connect to {}", remote_addr)).into());
             }
+            Err(_) => {
+                debug!("Timeout connecting to {}", remote_addr);
+                self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
+                let _ = client_stream.write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n").await;
+                return Err(ProxyError::Timeout.into());
+            }
         };
 
-        client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        // Set TCP keepalive for remote connection
+        let sock_ref = socket2::SockRef::from(&remote_stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+
+        if let Err(e) = client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
+            if is_expected_error(&e) {
+                trace!("Client disconnected during CONNECT response");
+                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+
         client_stream.flush().await?;
 
         if !is_whitelisted {
@@ -362,18 +451,34 @@ impl ConnectionHandler {
         remote_addr: &str,
         request_data: &[u8],
     ) -> Result<()> {
-        let mut remote_stream = match timeout(Duration::from_secs(5), TcpStream::connect(remote_addr)).await {
+        let mut remote_stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(remote_addr)).await {
             Ok(Ok(s)) => s,
-            _ => {
+            Ok(Err(e)) => {
+                debug!("Failed to connect to {}: {}", remote_addr, e);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                     .await;
                 return Err(ProxyError::Connection(format!("Failed to connect to {}", remote_addr)).into());
             }
+            Err(_) => {
+                debug!("Timeout connecting to {}", remote_addr);
+                self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
+                let _ = client_stream
+                    .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                return Err(ProxyError::Timeout.into());
+            }
         };
 
-        remote_stream.write_all(request_data).await?;
+        if let Err(e) = remote_stream.write_all(request_data).await {
+            if is_expected_error(&e) {
+                trace!("Remote disconnected while sending request");
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+
         remote_stream.flush().await?;
 
         self.pipe_connections(client_stream, remote_stream).await
@@ -390,7 +495,7 @@ impl ConnectionHandler {
             Ok(Ok(_)) => {},
             Ok(Err(_)) => {
                 // Not enough data, pass through
-                remote_stream.write_all(&header).await?;
+                let _ = remote_stream.write_all(&header).await;
                 return self.pipe_connections(client_stream, remote_stream).await;
             },
             Err(_) => return Err(ProxyError::Timeout.into()),
@@ -403,6 +508,14 @@ impl ConnectionHandler {
         }
 
         let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+        // Sanity check
+        if record_len > 16384 {
+            warn!("Suspicious TLS record length: {}", record_len);
+            remote_stream.write_all(&header).await?;
+            return self.pipe_connections(client_stream, remote_stream).await;
+        }
+
         let mut body = vec![0u8; record_len];
         match timeout(Duration::from_secs(5), client_stream.read_exact(&mut body)).await {
             Ok(Ok(_)) => {},
@@ -415,11 +528,12 @@ impl ConnectionHandler {
         }
 
         self.stats.fragmented_connections.fetch_add(1, Ordering::Relaxed);
+        trace!("Fragmenting TLS handshake ({}bytes)", record_len);
 
         // Fragment the ClientHello
         let fragments = fragment_tls_data(&body);
 
-        // Send fragmented data
+        // Send fragmented data with new TLS frames
         for fragment in fragments {
             let frame = create_tls_frame(&fragment);
             remote_stream.write_all(&frame).await?;
@@ -431,12 +545,19 @@ impl ConnectionHandler {
     }
 
     async fn pipe_connections(&self, mut client: TcpStream, mut remote: TcpStream) -> Result<()> {
-        let (bytes_to_server, bytes_to_client) = tokio::io::copy_bidirectional(&mut client, &mut remote).await?;
-        
-        self.stats.traffic_out.fetch_add(bytes_to_server, Ordering::Relaxed);
-        self.stats.traffic_in.fetch_add(bytes_to_client, Ordering::Relaxed);
-        
-        Ok(())
+        match tokio::io::copy_bidirectional(&mut client, &mut remote).await {
+            Ok((bytes_to_server, bytes_to_client)) => {
+                self.stats.traffic_out.fetch_add(bytes_to_server, Ordering::Relaxed);
+                self.stats.traffic_in.fetch_add(bytes_to_client, Ordering::Relaxed);
+                trace!("Connection closed: {}b up, {}b down", bytes_to_server, bytes_to_client);
+                Ok(())
+            }
+            Err(e) if is_expected_error(&e) => {
+                trace!("Connection closed: {}", e);
+                Ok(())
+            }
+            Err(e) => Err(e.into())
+        }
     }
 }
 
@@ -498,14 +619,14 @@ fn fragment_tls_data(data: &[u8]) -> Vec<Vec<u8>> {
     }
 
     // Random fragmentation
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     if data.len() <= 512 {
         let cut = data.len() / 2;
         fragments.push(data[..cut].to_vec());
         fragments.push(data[cut..].to_vec());
     } else {
-        let cut1 = rng.gen_range(32..128).min(data.len());
-        let cut2 = (cut1 + rng.gen_range(128..512)).min(data.len());
+        let cut1 = rng.random_range(32..128).min(data.len());
+        let cut2 = (cut1 + rng.random_range(128..512)).min(data.len());
         fragments.push(data[..cut1].to_vec());
         if cut2 > cut1 {
             fragments.push(data[cut1..cut2].to_vec());
@@ -519,10 +640,8 @@ fn fragment_tls_data(data: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn find_sni_position(data: &[u8]) -> Option<usize> {
-    // Simple SNI detection - look for 0x00 after potential domain name
     for (i, window) in data.windows(2).enumerate() {
         if window[0] != 0x00 && window[1] == 0x00 {
-            // Likely end of domain name
             return Some(i + 1);
         }
     }
@@ -542,12 +661,12 @@ fn create_tls_frame(data: &[u8]) -> Vec<u8> {
 fn print_banner(args: &Args) {
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║       \x1b[92mTLS Fragment Proxy v{}\x1b[0m                     ║", VERSION);
-    println!("║       \x1b[97mRandom Fragmentation Mode\x1b[0m                   ║");
+    println!("║       \x1b[97mOptimized Fragmentation Mode\x1b[0m                ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
-    
+
     println!("\x1b[92m[CONFIG]\x1b[0m");
     println!("  \x1b[97m├─ Address:\x1b[0m {}:{}", args.host, args.port);
-    println!("  \x1b[97m├─ Fragment Mode:\x1b[0m Random (Working Method)");
+    println!("  \x1b[97m├─ Fragment Mode:\x1b[0m Smart SNI Detection");
     println!("  \x1b[97m├─ Max Connections:\x1b[0m {}", args.max_connections);
     println!("  \x1b[97m├─ Rate Limit:\x1b[0m {}/sec per IP", args.rate_limit_per_second);
     println!("  \x1b[97m├─ Health Check:\x1b[0m http://127.0.0.1:8882/health");
@@ -565,11 +684,13 @@ async fn health_check_server(stats: Stats) {
                 let fragmented = stats.fragmented_connections.load(Ordering::Relaxed);
                 let traffic_in = stats.traffic_in.load(Ordering::Relaxed);
                 let traffic_out = stats.traffic_out.load(Ordering::Relaxed);
-                
+                let disconnects = stats.client_disconnects.load(Ordering::Relaxed);
+
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
-                    {{\"status\":\"healthy\",\"active\":{},\"total\":{},\"fragmented\":{},\"traffic_in\":{},\"traffic_out\":{}}}\n",
-                    active, total, fragmented, traffic_in, traffic_out
+                    {{\"status\":\"healthy\",\"active\":{},\"total\":{},\"fragmented\":{},\
+                    \"traffic_in\":{},\"traffic_out\":{},\"client_disconnects\":{}}}\n",
+                    active, total, fragmented, traffic_in, traffic_out, disconnects
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
             }
@@ -579,19 +700,52 @@ async fn health_check_server(stats: Stats) {
     }
 }
 
+async fn stats_reporter(stats: Stats) {
+    let mut interval = interval(Duration::from_secs(300)); // Report every 5 minutes
+    loop {
+        interval.tick().await;
+
+        let active = stats.active_connections.load(Ordering::Relaxed);
+        let total = stats.total_connections.load(Ordering::Relaxed);
+        let fragmented = stats.fragmented_connections.load(Ordering::Relaxed);
+        let whitelisted = stats.whitelisted_connections.load(Ordering::Relaxed);
+        let failed = stats.failed_connections.load(Ordering::Relaxed);
+        let disconnects = stats.client_disconnects.load(Ordering::Relaxed);
+        let traffic_in = stats.traffic_in.load(Ordering::Relaxed);
+        let traffic_out = stats.traffic_out.load(Ordering::Relaxed);
+
+        info!(
+            "Stats Report: Active={}, Total={}, Fragmented={}, Whitelisted={}, Failed={}, Disconnects={}, Traffic In={}, Traffic Out={}",
+            active,
+            total,
+            fragmented,
+            whitelisted,
+            failed,
+            disconnects,
+            format_size(traffic_in, BINARY),
+            format_size(traffic_out, BINARY)
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Setup logging
-    let filter_level = if args.verbose { 
-        Level::DEBUG 
-    } else { 
-        Level::INFO 
+    // Setup logging with better filtering
+    let filter_level = if args.verbose {
+        Level::TRACE
+    } else {
+        Level::INFO
     };
 
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(format!("tls_fragment_proxy={}", filter_level))
+        });
+
     tracing_subscriber::fmt()
-        .with_max_level(filter_level)
+        .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
         .init();
@@ -620,8 +774,10 @@ async fn main() -> Result<()> {
     info!("Proxy listening on {}", addr);
 
     // Start health check endpoint
-    let health_stats = stats.clone();
-    tokio::spawn(health_check_server(health_stats));
+    tokio::spawn(health_check_server(stats.clone()));
+
+    // Start stats reporter
+    tokio::spawn(stats_reporter(stats.clone()));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -645,8 +801,18 @@ async fn main() -> Result<()> {
                             if let Err(e) = handler.handle_client(stream, addr).await {
                                 match e.downcast_ref::<ProxyError>() {
                                     Some(ProxyError::RateLimited) => {},
+                                    Some(ProxyError::Timeout) => {
+                                        trace!("Connection timeout from {}", addr);
+                                    },
                                     _ => {
-                                        debug!("Error handling client {}: {}", addr, e);
+                                        // Check if it's an expected IO error
+                                        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                                            if !is_expected_error(io_err) {
+                                                debug!("Unexpected error handling client {}: {}", addr, e);
+                                            }
+                                        } else {
+                                            debug!("Error handling client {}: {}", addr, e);
+                                        }
                                     }
                                 }
                             }
@@ -654,6 +820,8 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);
+                        // Brief pause to avoid tight loop on persistent errors
+                        sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -662,13 +830,14 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(());
 
-    // Wait for active connections
+    // Wait for active connections with timeout
     let shutdown_timeout = Duration::from_secs(30);
     let shutdown_start = Instant::now();
-    
+
     while stats.active_connections.load(Ordering::Relaxed) > 0 {
         if shutdown_start.elapsed() > shutdown_timeout {
-            warn!("Shutdown timeout reached");
+            warn!("Shutdown timeout reached, {} connections still active", 
+                stats.active_connections.load(Ordering::Relaxed));
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -678,22 +847,24 @@ async fn main() -> Result<()> {
         println!("\n╔══════════════════════════════════════════════════════╗");
         println!("║                 \x1b[92mFINAL STATISTICS\x1b[0m                    ║");
         println!("╚══════════════════════════════════════════════════════╝\n");
-        
-        println!("  \x1b[97mTotal Connections:\x1b[0m      {}", 
-            stats.total_connections.load(Ordering::Relaxed));
-        println!("  \x1b[97mFragmented Connections:\x1b[0m {}", 
-            stats.fragmented_connections.load(Ordering::Relaxed));
-        println!("  \x1b[97mWhitelisted Connections:\x1b[0m {}", 
-            stats.whitelisted_connections.load(Ordering::Relaxed));
-        println!("  \x1b[97mFailed Connections:\x1b[0m     {}", 
-            stats.failed_connections.load(Ordering::Relaxed));
-        println!("  \x1b[97mRate Limited:\x1b[0m           {}", 
-            stats.rate_limited_connections.load(Ordering::Relaxed));
-        println!("  \x1b[97mTotal Downloaded:\x1b[0m       {}", 
-            format_size(stats.traffic_in.load(Ordering::Relaxed), BINARY));
-        println!("  \x1b[97mTotal Uploaded:\x1b[0m         {}", 
-            format_size(stats.traffic_out.load(Ordering::Relaxed), BINARY));
-        
+
+        println!("  \x1b[97mTotal Connections:\x1b[0m      {}",
+                 stats.total_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mFragmented Connections:\x1b[0m {}",
+                 stats.fragmented_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mWhitelisted Connections:\x1b[0m {}",
+                 stats.whitelisted_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mFailed Connections:\x1b[0m     {}",
+                 stats.failed_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mClient Disconnects:\x1b[0m     {}",
+                 stats.client_disconnects.load(Ordering::Relaxed));
+        println!("  \x1b[97mRate Limited:\x1b[0m           {}",
+                 stats.rate_limited_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mTotal Downloaded:\x1b[0m       {}",
+                 format_size(stats.traffic_in.load(Ordering::Relaxed), BINARY));
+        println!("  \x1b[97mTotal Uploaded:\x1b[0m         {}",
+                 format_size(stats.traffic_out.load(Ordering::Relaxed), BINARY));
+
         println!("\n\x1b[92m[SUCCESS]\x1b[0m Proxy shut down gracefully\n");
     }
 
