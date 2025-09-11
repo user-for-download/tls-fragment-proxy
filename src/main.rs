@@ -37,6 +37,9 @@ enum ProxyError {
 
     #[error("Rate limited")]
     RateLimited,
+
+    #[error("Configuration error: {0}")]
+    Configuration(String),
 }
 
 // Check if error is expected/normal
@@ -62,8 +65,8 @@ struct Args {
     #[arg(long, default_value_t = 8888)]
     port: u16,
 
-    #[arg(long, default_value = "blacklist.txt")]
-    blacklist: PathBuf,
+    #[arg(long)]
+    blacklist: Option<PathBuf>,
 
     #[arg(long)]
     whitelist: Option<PathBuf>,
@@ -87,6 +90,7 @@ struct Stats {
     active_connections: Arc<AtomicUsize>,
     fragmented_connections: Arc<AtomicUsize>,
     whitelisted_connections: Arc<AtomicUsize>,
+    blacklisted_blocks: Arc<AtomicUsize>,
     failed_connections: Arc<AtomicUsize>,
     rate_limited_connections: Arc<AtomicUsize>,
     client_disconnects: Arc<AtomicUsize>,
@@ -101,6 +105,7 @@ impl Stats {
             active_connections: Arc::new(AtomicUsize::new(0)),
             fragmented_connections: Arc::new(AtomicUsize::new(0)),
             whitelisted_connections: Arc::new(AtomicUsize::new(0)),
+            blacklisted_blocks: Arc::new(AtomicUsize::new(0)),
             failed_connections: Arc::new(AtomicUsize::new(0)),
             rate_limited_connections: Arc::new(AtomicUsize::new(0)),
             client_disconnects: Arc::new(AtomicUsize::new(0)),
@@ -192,6 +197,12 @@ impl RateLimiter {
 struct DomainFilter {
     blacklist: Arc<RwLock<HashSet<String>>>,
     whitelist: Arc<RwLock<HashSet<String>>>,
+    stats: Arc<DomainFilterStats>,
+}
+
+struct DomainFilterStats {
+    blacklist_domains: AtomicUsize,
+    whitelist_domains: AtomicUsize,
 }
 
 impl DomainFilter {
@@ -199,11 +210,28 @@ impl DomainFilter {
         let mut filter = Self {
             blacklist: Arc::new(RwLock::new(HashSet::new())),
             whitelist: Arc::new(RwLock::new(HashSet::new())),
+            stats: Arc::new(DomainFilterStats {
+                blacklist_domains: AtomicUsize::new(0),
+                whitelist_domains: AtomicUsize::new(0),
+            }),
         };
 
-        filter.load_list(&args.blacklist, ListType::Blacklist).await?;
+        // Load blacklist if specified
+        if let Some(blacklist_path) = &args.blacklist {
+            info!("Loading blacklist from: {}", blacklist_path.display());
+            filter.load_list(blacklist_path, ListType::Blacklist).await
+                .context(format!("Failed to load blacklist from {}", blacklist_path.display()))?;
+        } else {
+            info!("No blacklist specified, all domains allowed except whitelisted ones");
+        }
+
+        // Load whitelist if specified
         if let Some(whitelist_path) = &args.whitelist {
-            filter.load_list(whitelist_path, ListType::Whitelist).await?;
+            info!("Loading whitelist from: {}", whitelist_path.display());
+            filter.load_list(whitelist_path, ListType::Whitelist).await
+                .context(format!("Failed to load whitelist from {}", whitelist_path.display()))?;
+        } else {
+            info!("No whitelist specified, fragmentation will be applied to all non-blacklisted domains");
         }
 
         Ok(filter)
@@ -211,10 +239,14 @@ impl DomainFilter {
 
     async fn load_list(&mut self, path: &PathBuf, list_type: ListType) -> Result<()> {
         if !path.exists() {
-            return Ok(());
+            return Err(ProxyError::Configuration(
+                format!("File not found: {}", path.display())
+            ).into());
         }
 
-        let content = tokio::fs::read_to_string(path).await?;
+        let content = tokio::fs::read_to_string(path).await
+            .context(format!("Failed to read file: {}", path.display()))?;
+
         let domains: HashSet<String> = content
             .lines()
             .map(|line| line.trim())
@@ -226,12 +258,14 @@ impl DomainFilter {
 
         match list_type {
             ListType::Blacklist => {
-                *self.blacklist.write() = domains;  // No .await here
-                info!("Loaded {} domains from blacklist", count);
+                *self.blacklist.write() = domains;
+                self.stats.blacklist_domains.store(count, Ordering::Relaxed);
+                info!("✓ Loaded {} domains from blacklist", count);
             }
             ListType::Whitelist => {
-                *self.whitelist.write() = domains;  // No .await here
-                info!("Loaded {} domains from whitelist", count);
+                *self.whitelist.write() = domains;
+                self.stats.whitelist_domains.store(count, Ordering::Relaxed);
+                info!("✓ Loaded {} domains from whitelist", count);
             }
         }
 
@@ -248,7 +282,7 @@ impl DomainFilter {
 
     fn check_domain_match(&self, domain: &str, list: &Arc<RwLock<HashSet<String>>>) -> bool {
         let domain_lower = domain.to_lowercase();
-        let list_guard = list.read();  // No blocking_read(), just read()
+        let list_guard = list.read();
 
         // Check exact match
         if list_guard.contains(&domain_lower) {
@@ -267,6 +301,13 @@ impl DomainFilter {
         }
 
         false
+    }
+
+    fn get_stats(&self) -> (usize, usize) {
+        (
+            self.stats.blacklist_domains.load(Ordering::Relaxed),
+            self.stats.whitelist_domains.load(Ordering::Relaxed)
+        )
     }
 }
 
@@ -352,6 +393,7 @@ impl ConnectionHandler {
         // Check blacklist
         if self.filter.is_blacklisted(&host) {
             debug!("Blocked blacklisted domain: {}", host);
+            self.stats.blacklisted_blocks.fetch_add(1, Ordering::Relaxed);
             let _ = client_stream
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await;
@@ -651,7 +693,9 @@ fn create_tls_frame(data: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn print_banner(args: &Args) {
+fn print_banner(args: &Args, filter: &DomainFilter) {
+    let (blacklist_count, whitelist_count) = filter.get_stats();
+
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║       \x1b[92mTLS Fragment Proxy v{}\x1b[0m                     ║", VERSION);
     println!("║       \x1b[97mOptimized Fragmentation Mode\x1b[0m                ║");
@@ -662,6 +706,19 @@ fn print_banner(args: &Args) {
     println!("  \x1b[97m├─ Fragment Mode:\x1b[0m Smart SNI Detection");
     println!("  \x1b[97m├─ Max Connections:\x1b[0m {}", args.max_connections);
     println!("  \x1b[97m├─ Rate Limit:\x1b[0m {}/sec per IP", args.rate_limit_per_second);
+
+    if blacklist_count > 0 {
+        println!("  \x1b[97m├─ Blacklist:\x1b[0m {} domains loaded", blacklist_count);
+    } else {
+        println!("  \x1b[97m├─ Blacklist:\x1b[0m Not configured");
+    }
+
+    if whitelist_count > 0 {
+        println!("  \x1b[97m├─ Whitelist:\x1b[0m {} domains loaded", whitelist_count);
+    } else {
+        println!("  \x1b[97m├─ Whitelist:\x1b[0m Not configured");
+    }
+
     println!("  \x1b[97m├─ Health Check:\x1b[0m http://127.0.0.1:8882/health");
     println!("  \x1b[97m└─ Started:\x1b[0m {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
     println!("\n\x1b[92m[INFO]\x1b[0m Press \x1b[93mCtrl+C\x1b[0m to stop the proxy\n");
@@ -678,12 +735,16 @@ async fn health_check_server(stats: Stats) {
                 let traffic_in = stats.traffic_in.load(Ordering::Relaxed);
                 let traffic_out = stats.traffic_out.load(Ordering::Relaxed);
                 let disconnects = stats.client_disconnects.load(Ordering::Relaxed);
+                let blacklisted = stats.blacklisted_blocks.load(Ordering::Relaxed);
+                let whitelisted = stats.whitelisted_connections.load(Ordering::Relaxed);
 
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
                     {{\"status\":\"healthy\",\"active\":{},\"total\":{},\"fragmented\":{},\
-                    \"traffic_in\":{},\"traffic_out\":{},\"client_disconnects\":{}}}\n",
-                    active, total, fragmented, traffic_in, traffic_out, disconnects
+                    \"traffic_in\":{},\"traffic_out\":{},\"client_disconnects\":{},\
+                    \"blacklisted_blocks\":{},\"whitelisted_connections\":{}}}\n",
+                    active, total, fragmented, traffic_in, traffic_out, disconnects,
+                    blacklisted, whitelisted
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
             }
@@ -693,7 +754,7 @@ async fn health_check_server(stats: Stats) {
     }
 }
 
-async fn stats_reporter(stats: Stats) {
+async fn stats_reporter(stats: Stats, filter: Arc<DomainFilter>) {
     let mut interval = interval(Duration::from_secs(300)); // Report every 5 minutes
     loop {
         interval.tick().await;
@@ -702,21 +763,27 @@ async fn stats_reporter(stats: Stats) {
         let total = stats.total_connections.load(Ordering::Relaxed);
         let fragmented = stats.fragmented_connections.load(Ordering::Relaxed);
         let whitelisted = stats.whitelisted_connections.load(Ordering::Relaxed);
+        let blacklisted = stats.blacklisted_blocks.load(Ordering::Relaxed);
         let failed = stats.failed_connections.load(Ordering::Relaxed);
         let disconnects = stats.client_disconnects.load(Ordering::Relaxed);
         let traffic_in = stats.traffic_in.load(Ordering::Relaxed);
         let traffic_out = stats.traffic_out.load(Ordering::Relaxed);
 
+        let (bl_count, wl_count) = filter.get_stats();
+
         info!(
-            "Stats Report: Active={}, Total={}, Fragmented={}, Whitelisted={}, Failed={}, Disconnects={}, Traffic In={}, Traffic Out={}",
+            "Stats Report: Active={}, Total={}, Fragmented={}, Whitelisted={}, Blacklisted Blocks={}, Failed={}, Disconnects={}, Traffic In={}, Traffic Out={}, Lists: BL={} domains, WL={} domains",
             active,
             total,
             fragmented,
             whitelisted,
+            blacklisted,
             failed,
             disconnects,
             format_size(traffic_in, BINARY),
-            format_size(traffic_out, BINARY)
+            format_size(traffic_out, BINARY),
+            bl_count,
+            wl_count
         );
     }
 }
@@ -743,6 +810,9 @@ async fn main() -> Result<()> {
         .with_thread_ids(false)
         .init();
 
+    // Print initial loading messages
+    info!("Starting TLS Fragment Proxy v{}", VERSION);
+
     let filter = Arc::new(DomainFilter::new(&args).await?);
     let stats = Stats::new();
     let rate_limiter = Arc::new(RateLimiter::new(args.rate_limit_per_second));
@@ -756,7 +826,7 @@ async fn main() -> Result<()> {
     });
 
     if !args.quiet {
-        print_banner(&args);
+        print_banner(&args, &filter);
     }
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -770,7 +840,7 @@ async fn main() -> Result<()> {
     tokio::spawn(health_check_server(stats.clone()));
 
     // Start stats reporter
-    tokio::spawn(stats_reporter(stats.clone()));
+    tokio::spawn(stats_reporter(stats.clone(), Arc::clone(&filter)));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -829,12 +899,14 @@ async fn main() -> Result<()> {
 
     while stats.active_connections.load(Ordering::Relaxed) > 0 {
         if shutdown_start.elapsed() > shutdown_timeout {
-            warn!("Shutdown timeout reached, {} connections still active", 
+            warn!("Shutdown timeout reached, {} connections still active",
                 stats.active_connections.load(Ordering::Relaxed));
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
+
+    let (bl_count, wl_count) = filter.get_stats();
 
     if !args.quiet {
         println!("\n╔══════════════════════════════════════════════════════╗");
@@ -847,6 +919,8 @@ async fn main() -> Result<()> {
                  stats.fragmented_connections.load(Ordering::Relaxed));
         println!("  \x1b[97mWhitelisted Connections:\x1b[0m {}",
                  stats.whitelisted_connections.load(Ordering::Relaxed));
+        println!("  \x1b[97mBlacklisted Blocks:\x1b[0m     {}",
+                 stats.blacklisted_blocks.load(Ordering::Relaxed));
         println!("  \x1b[97mFailed Connections:\x1b[0m     {}",
                  stats.failed_connections.load(Ordering::Relaxed));
         println!("  \x1b[97mClient Disconnects:\x1b[0m     {}",
@@ -857,6 +931,8 @@ async fn main() -> Result<()> {
                  format_size(stats.traffic_in.load(Ordering::Relaxed), BINARY));
         println!("  \x1b[97mTotal Uploaded:\x1b[0m         {}",
                  format_size(stats.traffic_out.load(Ordering::Relaxed), BINARY));
+        println!("  \x1b[97mBlacklist Domains:\x1b[0m      {}", bl_count);
+        println!("  \x1b[97mWhitelist Domains:\x1b[0m      {}", wl_count);
 
         println!("\n\x1b[92m[SUCCESS]\x1b[0m Proxy shut down gracefully\n");
     }
