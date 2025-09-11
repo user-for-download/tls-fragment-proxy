@@ -201,78 +201,66 @@ impl DomainFilter {
             whitelist: Arc::new(RwLock::new(HashSet::new())),
         };
 
-        filter.load_blacklist(&args.blacklist).await?;
+        filter.load_list(&args.blacklist, ListType::Blacklist).await?;
         if let Some(whitelist_path) = &args.whitelist {
-            filter.load_whitelist(whitelist_path).await?;
+            filter.load_list(whitelist_path, ListType::Whitelist).await?;
         }
 
         Ok(filter)
     }
 
-    async fn load_blacklist(&mut self, path: &PathBuf) -> Result<()> {
-        if path.exists() {
-            let content = tokio::fs::read_to_string(path).await?;
-            let mut blacklist = self.blacklist.write();
-            for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    blacklist.insert(line.to_lowercase());
-                }
-            }
-            info!("Loaded {} domains from blacklist", blacklist.len());
+    async fn load_list(&mut self, path: &PathBuf, list_type: ListType) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
         }
-        Ok(())
-    }
 
-    async fn load_whitelist(&mut self, path: &PathBuf) -> Result<()> {
-        if path.exists() {
-            let content = tokio::fs::read_to_string(path).await?;
-            let mut whitelist = self.whitelist.write();
-            for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    whitelist.insert(line.to_lowercase());
-                }
+        let content = tokio::fs::read_to_string(path).await?;
+        let domains: HashSet<String> = content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.to_lowercase())
+            .collect();
+
+        let count = domains.len();
+
+        match list_type {
+            ListType::Blacklist => {
+                *self.blacklist.write() = domains;  // No .await here
+                info!("Loaded {} domains from blacklist", count);
             }
-            info!("Loaded {} domains from whitelist", whitelist.len());
+            ListType::Whitelist => {
+                *self.whitelist.write() = domains;  // No .await here
+                info!("Loaded {} domains from whitelist", count);
+            }
         }
+
         Ok(())
     }
 
     fn is_whitelisted(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
-        let whitelist = self.whitelist.read();
-
-        if whitelist.contains(&domain_lower) {
-            return true;
-        }
-
-        // Check subdomain matching
-        for whitelisted in whitelist.iter() {
-            if whitelisted.starts_with("*.") {
-                let suffix = &whitelisted[2..];
-                if domain_lower.ends_with(suffix) || domain_lower == suffix {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.check_domain_match(domain, &self.whitelist)
     }
 
     fn is_blacklisted(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
-        let blacklist = self.blacklist.read();
+        self.check_domain_match(domain, &self.blacklist)
+    }
 
-        if blacklist.contains(&domain_lower) {
+    fn check_domain_match(&self, domain: &str, list: &Arc<RwLock<HashSet<String>>>) -> bool {
+        let domain_lower = domain.to_lowercase();
+        let list_guard = list.read();  // No blocking_read(), just read()
+
+        // Check exact match
+        if list_guard.contains(&domain_lower) {
             return true;
         }
 
-        // Check subdomain matching
-        for blacklisted in blacklist.iter() {
-            if blacklisted.starts_with("*.") {
-                let suffix = &blacklisted[2..];
-                if domain_lower.ends_with(suffix) || domain_lower == suffix {
+        // Check wildcard subdomain matching
+        for listed_domain in list_guard.iter() {
+            if let Some(suffix) = listed_domain.strip_prefix("*.") {
+                // Match if domain is exactly the suffix or is a proper subdomain
+                if domain_lower == suffix ||
+                    domain_lower.ends_with(&format!(".{}", suffix)) {
                     return true;
                 }
             }
@@ -280,6 +268,11 @@ impl DomainFilter {
 
         false
     }
+}
+
+enum ListType {
+    Blacklist,
+    Whitelist,
 }
 
 struct ConnectionHandler {
