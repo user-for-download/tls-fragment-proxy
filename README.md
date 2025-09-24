@@ -14,23 +14,10 @@ High-performance HTTP/HTTPS proxy with TLS fragmentation.
 ## Build
 
 ```bash
-cargo build --release
-
-# Or with optimizations
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-```
-
-## Installation
-
-```bash
-# Install from source
-cargo install --path .
-
-# Or download binary
 git clone https://github.com/user-for-download/tls-fragment-proxy.git
-chmod +x tls-fragment-proxy
+cd  tls-fragment-proxy
+cargo build --release
 ```
-
 ## Usage
 
 ```bash
