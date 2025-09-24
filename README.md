@@ -1,372 +1,225 @@
-# 🔒 TLS Fragment Proxy
+# TLS Fragment Proxy
 
-[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/user-for-download/tls-fragment-proxy/releases)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/user-for-download/tls-fragment-proxy)
+High-performance HTTP/HTTPS proxy with TLS fragmentation.
 
-A lightweight, high-performance HTTP/HTTPS proxy that uses TLS fragmentation to bypass DPI (Deep Packet Inspection) systems. Built with Rust and Tokio for maximum efficiency and reliability.
+## Features
 
-## 🎯 Key Features
+- TLS handshake fragmentation
+- Multi-tiered domain filtering (blacklist/whitelist)
+- Memory-efficient buffer pooling
+- Lock-free rate limiting
+- Real-time statistics
+- Health check endpoint
 
-- **TLS Fragmentation** - Splits TLS handshakes at SNI boundary to evade DPI
-- **Smart Detection** - Automatically detects and fragments at optimal positions
-- **High Performance** - Async I/O with Tokio, handles thousands of concurrent connections
-- **Domain Filtering** - Blacklist/whitelist support with wildcard patterns
-- **Rate Limiting** - Per-IP rate limiting to prevent abuse
-- **Real-time Monitoring** - Health check endpoint with JSON metrics
-- **Zero Configuration** - Works out of the box with sensible defaults
-
-## 🚀 Quick Start
-
-### Installation
+## Build
 
 ```bash
-# Clone and build
-git clone https://github.com/user-for-download/tls-fragment-proxy.git
-cd tls-fragment-proxy
 cargo build --release
 
-# Or install directly
-cargo install --git https://github.com/user-for-download/tls-fragment-proxy.git
+# Or with optimizations
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### Basic Usage
+## Installation
 
 ```bash
-# Start the proxy (listens on 127.0.0.1:8881 by default)
-./target/release/tls-fragment-proxy
+# Install from source
+cargo install --path .
 
-# Configure your system to use the proxy
-export http_proxy=http://127.0.0.1:8881
-export https_proxy=http://127.0.0.1:8881
-
-# Test it
-curl https://www.google.com
+# Or download binary
+wget https://github.com/user/tls-fragment-proxy/releases/latest/download/tls-fragment-proxy
+chmod +x tls-fragment-proxy
 ```
 
-### Docker
+## Usage
 
 ```bash
-# Or build locally
-docker build -t tls-fragment-proxy .
-docker run -d -p 8881:8881 -p 8882:8882 tls-fragment-proxy
+# Basic
+./tls-fragment-proxy
+
+# With domain filtering
+./tls-fragment-proxy --blacklist blocked.txt --whitelist allowed.txt
+
+# Custom port and rate limiting
+./tls-fragment-proxy --port 8080 --rate-limit-per-second 100 --max-connections 5000
+
+# Preprocess large domain lists for faster loading
+./tls-fragment-proxy --preprocess-lists --blacklist domains.txt
+# Then use the binary version
+./tls-fragment-proxy --blacklist-binary blocked.bin
+
+# Verbose logging
+./tls-fragment-proxy -v
+
+# Quiet mode
+./tls-fragment-proxy -q
 ```
 
-## 📋 Configuration
+## Options
 
-### Command Line Options
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | 0.0.0.0 | Bind address |
+| `--port` | 8888 | Proxy port |
+| `--blacklist` | - | Path to blacklist file |
+| `--whitelist` | - | Path to whitelist file |
+| `--blacklist-binary` | - | Path to preprocessed blacklist |
+| `--whitelist-binary` | - | Path to preprocessed whitelist |
+| `--max-connections` | 1000 | Maximum concurrent connections |
+| `--rate-limit-per-second` | 1000 | Requests per second per IP |
+| `--worker-threads` | 4 | Number of worker threads |
+| `--buffer-pool-size` | 100 | Buffer pool size |
+| `--cache-size` | 10000 | LRU cache size |
+| `--preprocess-lists` | false | Convert text lists to binary format |
+| `-v, --verbose` | false | Enable trace logging |
+| `-q, --quiet` | false | Disable banner |
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--host` | `127.0.0.1` | Bind address |
-| `--port` | `8881` | Proxy port |
-| `--max-connections` | `1000` | Maximum concurrent connections |
-| `--rate-limit-per-second` | `1000` | Requests per second per IP |
-| `--blacklist` | `blacklist.txt` | Path to blacklist file |
-| `--whitelist` | - | Path to whitelist file (optional) |
-| `--verbose` | `false` | Enable debug logging |
-| `--quiet` | `false` | Suppress output |
+## Client Configuration
 
-### Example with Options
+### Browser (Firefox/Chrome)
+```
+HTTP Proxy: 127.0.0.1:8888
+HTTPS Proxy: 127.0.0.1:8888
+```
+
+### System-wide (Linux)
+```bash
+export http_proxy=http://127.0.0.1:8888
+export https_proxy=http://127.0.0.1:8888
+```
+
+### curl
+```bash
+curl -x http://127.0.0.1:8888 https://example.com
+```
+
+## Domain List Format
+
+```
+# Exact match
+example.com
+
+# Wildcard (matches all subdomains)
+*.subdomain.com
+
+# Comments supported
+# blocked-site.net
+```
+
+## Architecture
+
+```
+Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
+                        ↓
+                 [Cache | Bloom | Radix Tree | Aho-Corasick]
+```
+
+### Domain Filter Tiers
+1. **LRU Cache** - Recent lookups (microseconds)
+2. **Bloom Filter** - Fast negative checks (nanoseconds)
+3. **Radix Tree** - Exact domain matches (microseconds)
+4. **Aho-Corasick** - Wildcard patterns (microseconds)
+
+## Example
 
 ```bash
-./tls-fragment-proxy \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --max-connections 5000 \
-  --blacklist ./my-blacklist.txt \
-  --whitelist ./my-whitelist.txt \
-  --verbose
-```
+[ubuntu@rust]$ ./target/release/tls-fragment-proxy --port 8888 --host 0.0.0.0 --verbose --blacklist blacklist.txt --whitelist whitelist.txt --worker-threads 8 --buffer-pool-size 400
+2025-09-24T06:52:59.871020Z  INFO Starting TLS Fragment Proxy v1.0.4
+2025-09-24T06:52:59.871176Z  INFO Loading text blacklist from: /home/ubuntu/git/dip/blacklist.txt
+2025-09-24T06:53:00.609835Z  INFO ✓ Loaded 93850 domains (93850 exact, 0 wildcard) from blacklist in 0.74s
+2025-09-24T06:53:00.628875Z  INFO Loading text whitelist from: /home/ubuntu/git/dip/whitelist.txt
+2025-09-24T06:53:00.633410Z  INFO ✓ Loaded 89 domains (39 exact, 50 wildcard) from whitelist in 0.00s
 
-## 🔧 How It Works
-
-The proxy uses a proven fragmentation technique that:
-
-1. **Intercepts HTTPS connections** via HTTP CONNECT tunneling
-2. **Analyzes TLS ClientHello** packets to find the SNI extension
-3. **Fragments at the SNI boundary** - splits right after the domain name
-4. **Falls back to random fragmentation** when SNI detection fails
-5. **Reassembles transparently** at the destination
-
-This approach is effective because many DPI systems:
-- Only inspect the first few packets
-- Have limited buffer space for reassembly
-- Fail to handle fragmented SNI fields correctly
-
-## 🌐 Client Configuration
-
-### Browser Setup
-
-**Firefox:**
-1. Settings → Network Settings → Settings
-2. Manual proxy configuration
-3. HTTP Proxy: `127.0.0.1` Port: `8881`
-4. Check "Also use this proxy for HTTPS"
-
-**Chrome/Chromium:**
-```bash
-google-chrome --proxy-server="http://127.0.0.1:8881"
-```
-
-### System-wide (Linux/macOS)
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-export http_proxy=http://127.0.0.1:8881
-export https_proxy=http://127.0.0.1:8881
-export HTTP_PROXY=http://127.0.0.1:8881
-export HTTPS_PROXY=http://127.0.0.1:8881
-```
-
-### System-wide (Windows)
-
-```powershell
-# PowerShell (temporary)
-$env:HTTP_PROXY="http://127.0.0.1:8881"
-$env:HTTPS_PROXY="http://127.0.0.1:8881"
-
-# Or use system settings
-netsh winhttp set proxy 127.0.0.1:8881
-```
-
-## 📊 Monitoring
-
-### Health Check
-
-```bash
-# Check if proxy is healthy
-curl http://127.0.0.1:8882/health
-```
-
-Response:
-```json
-{
-  "status": "healthy",
-  "active": 42,
-  "total": 1337,
-  "fragmented": 1250,
-  "traffic_in": 104857600,
-  "traffic_out": 524288000
-}
-```
-
-### Real-time Statistics
-
-The proxy displays statistics on shutdown:
-
-```
 ╔══════════════════════════════════════════════════════╗
-║                 FINAL STATISTICS                      ║
+║       TLS Fragment Proxy v1.0.4                      ║
 ╚══════════════════════════════════════════════════════╝
 
-  Total Connections:      1523
-  Fragmented Connections: 1456
-  Whitelisted Connections: 67
-  Failed Connections:     12
+[CONFIG]
+  ├─ Address: 0.0.0.0:8888
+  ├─ Fragment Mode: Smart SNI Detection
+  ├─ Max Connections: 1000
+  ├─ Rate Limit: 1000/sec per IP
+  ├─ Worker Threads: 8
+  ├─ Buffer Pool Size: 400
+  ├─ LRU Cache Size: 10000
+  ├─ Blacklist: 93850 domains loaded
+  ├─ Whitelist: 89 domains loaded
+  ├─ Health Check: http://127.0.0.1:8882/health
+  └─ Started: 2025-09-24 09:53:00
+
+[INFO] Press Ctrl+C to stop the proxy
+
+2025-09-24T06:53:00.634321Z  INFO Proxy listening on 0.0.0.0:8888
+2025-09-24T06:53:00.634448Z  INFO Health check endpoint listening on 127.0.0.1:8882
+2025-09-24T06:53:00.635840Z  INFO Stats: Active=0, Total=0, Fragmented=0, WL=0, BL-Blocks=0, Failed=0, Disconnects=0, Traffic: In=0 B, Out=0 B, Lists: BL=93850, WL=89, Cache: 0.0% hit rate, Bloom FPs=0
+^C2025-09-24T06:53:01.804164Z  INFO Shutdown signal received
+2025-09-24T06:53:01.804198Z  INFO Initiating graceful shutdown...
+
+╔══════════════════════════════════════════════════════╗
+║                 FINAL STATISTICS                     ║
+╚══════════════════════════════════════════════════════╝
+
+  Total Connections:      0
+  Fragmented Connections: 0
+  Whitelisted Connections: 0
+  Blacklisted Blocks:     0
+  Failed Connections:     0
+  Client Disconnects:     0
   Rate Limited:           0
-  Total Downloaded:       1.2 GB
-  Total Uploaded:         245 MB
+  Total Downloaded:       0 B
+  Total Uploaded:         0 B
+  Blacklist Domains:      93850
+  Whitelist Domains:      89
+  Cache Hits:             0
+  Cache Misses:           0
+  Bloom False Positives:  0
+
+[SUCCESS] Proxy shut down gracefully
+
 ```
+## Performance
+- Handles 10K+ concurrent connections
+- Sub-millisecond domain filtering with millions of entries
+- Zero-copy buffer operations where possible
+- Memory-mapped files for lists >100MB
+- ~5-10% overhead vs direct connection
 
-## 🔒 Domain Filtering
 
-### Blacklist Format
+## Troubleshooting
 
-Create `blacklist.txt`:
-```
-# Block specific domains
-ads.example.com
-tracking.site.com
+### High Memory Usage
+- Preprocess large domain lists: `--preprocess-lists`
+- Reduce cache size: `--cache-size 1000`
+- Use binary format for domain lists
 
-# Block with wildcards
-*.doubleclick.net
-*.facebook.com
-```
+### Connection Refused
+- Check if port is already in use: `lsof -i:8888`
+- Verify bind address: `--host 0.0.0.0`
 
-### Whitelist Format
+### Slow Performance
+- Increase worker threads: `--worker-threads 8`
+- Increase buffer pool: `--buffer-pool-size 200`
+- Use binary domain lists instead of text
 
-Create `whitelist.txt`:
-```
-# Bypass fragmentation for trusted sites
-*.mycompany.com
-*.local
-api.trusted-service.com
-```
-
-## 🐳 Docker Deployment
-
-### Dockerfile
+## Docker
 
 ```dockerfile
-FROM rust:1.70-slim as builder
+FROM rust:1.70 as builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/tls-fragment-proxy /usr/local/bin/
-EXPOSE 8881 8882
-ENTRYPOINT ["tls-fragment-proxy"]
-CMD ["--host", "0.0.0.0"]
+EXPOSE 8888
+CMD ["tls-fragment-proxy"]
 ```
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  tls-proxy:
-    build: .
-    container_name: tls-fragment-proxy
-    ports:
-      - "8881:8881"  # Proxy port
-      - "8882:8882"  # Health check port
-    volumes:
-      - ./blacklist.txt:/blacklist.txt:ro
-      - ./whitelist.txt:/whitelist.txt:ro
-    command:
-      - --host=0.0.0.0
-      - --blacklist=/blacklist.txt
-      - --whitelist=/whitelist.txt
-      - --max-connections=5000
-    restart: unless-stopped
-```
-
-## 🔧 Systemd Service
-
-Create `/etc/systemd/system/tls-fragment-proxy.service`:
-
-```ini
-[Unit]
-Description=TLS Fragment Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-Group=nogroup
-ExecStart=/usr/local/bin/tls-fragment-proxy --host 0.0.0.0
-Restart=always
-RestartSec=10
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable tls-fragment-proxy
-sudo systemctl start tls-fragment-proxy
-```
-
-## 🧪 Testing
-
-### Basic Connectivity Test
 
 ```bash
-# Test HTTP
-curl -x http://127.0.0.1:8881 http://httpbin.org/ip
-
-# Test HTTPS
-curl -x http://127.0.0.1:8881 https://httpbin.org/ip
-
-# Verbose test
-curl -v -x http://127.0.0.1:8881 https://www.google.com
+docker build -t tls-fragment-proxy .
+docker run -p 8888:8888 tls-fragment-proxy
 ```
 
-### Performance Test
+## License
 
-```bash
-# Using Apache Bench
-ab -n 1000 -c 100 -X 127.0.0.1:8881 https://example.com/
-
-# Using wrk
-wrk -t12 -c400 -d30s --latency http://127.0.0.1:8881
-```
-
-## 🛠️ Troubleshooting
-
-### Common Issues
-
-| Problem | Solution |
-|---------|----------|
-| "Address already in use" | Another service is using port 8881. Change with `--port` |
-| "Too many open files" | Increase ulimit: `ulimit -n 65535` |
-| Sites not loading | Check if domain is blacklisted, try adding to whitelist |
-| High CPU usage | Reduce `--max-connections` |
-| Connection refused | Check firewall settings, ensure proxy is running |
-
-### Debug Mode
-
-```bash
-# Enable verbose logging
-./tls-fragment-proxy --verbose
-
-# Check logs
-journalctl -f | grep tls-fragment
-
-# Monitor connections
-ss -tnp | grep 8881
-```
-
-
-## 🏗️ Building from Source
-
-### Requirements
-
-- Rust 1.70+ (via [rustup](https://rustup.rs/))
-- Git
-
-### Build Steps
-
-```bash
-# Clone repository
-git clone https://github.com/user-for-download/tls-fragment-proxy.git
-cd tls-fragment-proxy
-
-# Build debug version
-cargo build
-
-# Build optimized release version
-cargo build --release
-
-# Run tests
-cargo test
-
-# Install locally
-cargo install --path .
-```
-
-## 📚 Technical Details
-
-### Dependencies
-
-- **tokio** - Async runtime
-- **clap** - Command line parsing
-- **dashmap** - Concurrent hashmap
-- **tracing** - Structured logging
-- **anyhow** - Error handling
-- **thiserror** - Custom error types
-
-### Architecture
-
-The proxy uses a multi-threaded async architecture:
-- Main thread handles incoming connections
-- Tokio runtime spawns tasks for each connection
-- Shared state protected by Arc/Mutex
-- Lock-free data structures where possible
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT
