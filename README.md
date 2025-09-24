@@ -94,7 +94,7 @@ example.com
 ```
 
 ## use binary
-###INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
+### INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
 ```bash
 2025-09-24T07:39:45.119449Z  INFO Starting TLS Fragment Proxy v1.0.4
 2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: /home/ubuntu/git/dip/blacklist.bin
