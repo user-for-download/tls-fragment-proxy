@@ -27,7 +27,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 cargo install --path .
 
 # Or download binary
-wget https://github.com/user/tls-fragment-proxy/releases/latest/download/tls-fragment-proxy
+git clone https://github.com/user-for-download/tls-fragment-proxy.git
 chmod +x tls-fragment-proxy
 ```
 
@@ -106,6 +106,15 @@ example.com
 # blocked-site.net
 ```
 
+## use binary
+###INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
+```bash
+2025-09-24T07:39:45.119449Z  INFO Starting TLS Fragment Proxy v1.0.4
+2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: /home/ubuntu/git/dip/blacklist.bin
+2025-09-24T07:39:45.437229Z  INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
+2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: /home/ubuntu/git/dip/whitelist.bin
+2025-09-24T07:39:45.438570Z  INFO ✓ Loaded 89 domains from binary whitelist in 0.00s
+```
 ## Architecture
 
 ```
@@ -123,12 +132,12 @@ Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
 ## Example
 
 ```bash
-[ubuntu@rust]$ ./target/release/tls-fragment-proxy --port 8888 --host 0.0.0.0 --verbose --blacklist blacklist.txt --whitelist whitelist.txt --worker-threads 8 --buffer-pool-size 400
-2025-09-24T06:52:59.871020Z  INFO Starting TLS Fragment Proxy v1.0.4
-2025-09-24T06:52:59.871176Z  INFO Loading text blacklist from: /home/ubuntu/git/dip/blacklist.txt
-2025-09-24T06:53:00.609835Z  INFO ✓ Loaded 93850 domains (93850 exact, 0 wildcard) from blacklist in 0.74s
-2025-09-24T06:53:00.628875Z  INFO Loading text whitelist from: /home/ubuntu/git/dip/whitelist.txt
-2025-09-24T06:53:00.633410Z  INFO ✓ Loaded 89 domains (39 exact, 50 wildcard) from whitelist in 0.00s
+[ubuntu@rust01]$ ./target/release/tls-fragment-proxy --port 8888 --host 0.0.0.0 --verbose --blacklist-binary /home/ubuntu/git/dip/blacklist.bin --whitelist-binary /home/ubuntu/git/dip/whitelist.bin --worker-threads 2
+2025-09-24T07:39:45.119449Z  INFO Starting TLS Fragment Proxy v1.0.4
+2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: /home/ubuntu/git/dip/blacklist.bin
+2025-09-24T07:39:45.437229Z  INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
+2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: /home/ubuntu/git/dip/whitelist.bin
+2025-09-24T07:39:45.438570Z  INFO ✓ Loaded 89 domains from binary whitelist in 0.00s
 
 ╔══════════════════════════════════════════════════════╗
 ║       TLS Fragment Proxy v1.0.4                      ║
@@ -139,24 +148,24 @@ Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
   ├─ Fragment Mode: Smart SNI Detection
   ├─ Max Connections: 1000
   ├─ Rate Limit: 1000/sec per IP
-  ├─ Worker Threads: 8
-  ├─ Buffer Pool Size: 400
+  ├─ Worker Threads: 2
+  ├─ Buffer Pool Size: 100
   ├─ LRU Cache Size: 10000
-  ├─ Blacklist: 93850 domains loaded
+  ├─ Blacklist: 938471 domains loaded
   ├─ Whitelist: 89 domains loaded
   ├─ Health Check: http://127.0.0.1:8882/health
-  └─ Started: 2025-09-24 09:53:00
+  └─ Started: 2025-09-24 10:39:45
 
 [INFO] Press Ctrl+C to stop the proxy
 
-2025-09-24T06:53:00.634321Z  INFO Proxy listening on 0.0.0.0:8888
-2025-09-24T06:53:00.634448Z  INFO Health check endpoint listening on 127.0.0.1:8882
-2025-09-24T06:53:00.635840Z  INFO Stats: Active=0, Total=0, Fragmented=0, WL=0, BL-Blocks=0, Failed=0, Disconnects=0, Traffic: In=0 B, Out=0 B, Lists: BL=93850, WL=89, Cache: 0.0% hit rate, Bloom FPs=0
-^C2025-09-24T06:53:01.804164Z  INFO Shutdown signal received
-2025-09-24T06:53:01.804198Z  INFO Initiating graceful shutdown...
+2025-09-24T07:39:45.438923Z  INFO Proxy listening on 0.0.0.0:8888
+2025-09-24T07:39:45.439047Z  INFO Health check endpoint listening on 127.0.0.1:8882
+2025-09-24T07:39:45.439969Z  INFO Stats: Active=0, Total=0, Fragmented=0, WL=0, BL-Blocks=0, Failed=0, Disconnects=0, Traffic: In=0 B, Out=0 B, Lists: BL=938471, WL=89, Cache: 0.0% hit rate, Bloom FPs=0
+^C2025-09-24T07:39:46.364009Z  INFO Shutdown signal received
+2025-09-24T07:39:46.364090Z  INFO Initiating graceful shutdown...
 
 ╔══════════════════════════════════════════════════════╗
-║                 FINAL STATISTICS                     ║
+║                 FINAL STATISTICS                    ║
 ╚══════════════════════════════════════════════════════╝
 
   Total Connections:      0
@@ -168,7 +177,7 @@ Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
   Rate Limited:           0
   Total Downloaded:       0 B
   Total Uploaded:         0 B
-  Blacklist Domains:      93850
+  Blacklist Domains:      938471
   Whitelist Domains:      89
   Cache Hits:             0
   Cache Misses:           0
@@ -176,6 +185,23 @@ Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
 
 [SUCCESS] Proxy shut down gracefully
 
+```
+```bash
+[ubuntu@rust]$ watch -n 1 'curl -s http://127.0.0.1:8882/health | jq .'
+{
+  "status": "healthy",
+  "active": 2,
+  "total": 5,
+  "fragmented": 5,
+  "traffic_in": 19344,
+  "traffic_out": 2061,
+  "client_disconnects": 0,
+  "blacklisted_blocks": 0,
+  "whitelisted_connections": 0,
+  "cache_hits": 4,
+  "cache_misses": 6,
+  "bloom_false_positives": 0
+}
 ```
 ## Performance
 - Handles 10K+ concurrent connections

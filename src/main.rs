@@ -59,6 +59,12 @@ enum ProxyError {
     HttpParse(#[from] httparse::Error),
 }
 
+// Disconnect type for consistent logging
+enum DisconnectType {
+    Expected,    // Normal client disconnects - trace level
+    Unexpected,  // Unexpected errors - debug level
+}
+
 // Check if error is expected/normal
 fn is_expected_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -288,6 +294,40 @@ impl OptimizedDomainFilter {
         Ok(filter)
     }
 
+    fn update_tree_and_stats(&mut self, tree: RadixNode, domain_count: usize, list_type: ListType) {
+        match list_type {
+            ListType::Blacklist => {
+                *self.blacklist_tree.write() = tree;
+                self.stats.blacklist_domains.store(domain_count, Ordering::Relaxed);
+            }
+            ListType::Whitelist => {
+                *self.whitelist_tree.write() = tree;
+                self.stats.whitelist_domains.store(domain_count, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn set_bloom_filter(&mut self, bloom: Bloom<Vec<u8>>, list_type: ListType) {
+        match list_type {
+            ListType::Blacklist => self.blacklist_bloom = Some(Arc::new(bloom)),
+            ListType::Whitelist => self.whitelist_bloom = Some(Arc::new(bloom)),
+        }
+    }
+
+    fn set_wildcard_automaton(&mut self, ac: AhoCorasick, list_type: ListType) {
+        match list_type {
+            ListType::Blacklist => self.blacklist_wildcard = Some(Arc::new(ac)),
+            ListType::Whitelist => self.whitelist_wildcard = Some(Arc::new(ac)),
+        }
+    }
+
+    fn list_type_name(list_type: &ListType) -> &'static str {
+        match list_type {
+            ListType::Blacklist => "blacklist",
+            ListType::Whitelist => "whitelist",
+        }
+    }
+
     async fn load_text_list(&mut self, path: &PathBuf, list_type: ListType) -> Result<()> {
         if !path.exists() {
             return Err(ProxyError::Configuration(
@@ -336,6 +376,7 @@ impl OptimizedDomainFilter {
 
         let total_count = exact_domains.len() + wildcard_patterns.len();
 
+        // Build bloom filter for exact domains
         if !exact_domains.is_empty() {
             let mut bloom = Bloom::new_for_fp_rate(exact_domains.len(), BLOOM_FALSE_POSITIVE_RATE)
                 .map_err(|e| anyhow::anyhow!("Failed to create bloom filter: {}", e))?;
@@ -344,10 +385,7 @@ impl OptimizedDomainFilter {
                 bloom.set(&domain.as_bytes().to_vec());
             }
 
-            match list_type {
-                ListType::Blacklist => self.blacklist_bloom = Some(Arc::new(bloom)),
-                ListType::Whitelist => self.whitelist_bloom = Some(Arc::new(bloom)),
-            }
+            self.set_bloom_filter(bloom, list_type);
         }
 
         // Build radix tree for exact domains
@@ -356,16 +394,8 @@ impl OptimizedDomainFilter {
             tree.insert(domain);
         }
 
-        match list_type {
-            ListType::Blacklist => {
-                *self.blacklist_tree.write() = tree;
-                self.stats.blacklist_domains.store(total_count, Ordering::Relaxed);
-            }
-            ListType::Whitelist => {
-                *self.whitelist_tree.write() = tree;
-                self.stats.whitelist_domains.store(total_count, Ordering::Relaxed);
-            }
-        }
+        // Update tree and stats using helper method
+        self.update_tree_and_stats(tree, total_count, list_type);
 
         // Build Aho-Corasick automaton for wildcard patterns
         if !wildcard_patterns.is_empty() {
@@ -384,10 +414,7 @@ impl OptimizedDomainFilter {
                 .build(patterns)
                 .context("Failed to build Aho-Corasick automaton")?;
 
-            match list_type {
-                ListType::Blacklist => self.blacklist_wildcard = Some(Arc::new(ac)),
-                ListType::Whitelist => self.whitelist_wildcard = Some(Arc::new(ac)),
-            }
+            self.set_wildcard_automaton(ac, list_type);
         }
 
         let elapsed = start.elapsed();
@@ -396,10 +423,7 @@ impl OptimizedDomainFilter {
             total_count,
             exact_domains.len(),
             wildcard_patterns.len(),
-            match list_type {
-                ListType::Blacklist => "blacklist",
-                ListType::Whitelist => "whitelist",
-            },
+            Self::list_type_name(&list_type),
             elapsed.as_secs_f64()
         );
 
@@ -428,62 +452,53 @@ impl OptimizedDomainFilter {
         let (tree, _): (RadixNode, _) = bincode::serde::decode_from_slice(&data, config::standard())
             .context("Failed to deserialize binary domain list")?;
 
-        match list_type {
-            ListType::Blacklist => {
-                *self.blacklist_tree.write() = tree;
-            }
-            ListType::Whitelist => {
-                *self.whitelist_tree.write() = tree;
-            }
-        }
+        // Count domains in the tree for statistics
+        let domain_count = count_domains_in_tree(&tree);
+
+        // Update tree and stats using helper method
+        self.update_tree_and_stats(tree, domain_count, list_type);
 
         let elapsed = start.elapsed();
         info!(
-            "✓ Loaded binary {} in {:.2}s",
-            match list_type {
-                ListType::Blacklist => "blacklist",
-                ListType::Whitelist => "whitelist",
-            },
+            "✓ Loaded {} domains from binary {} in {:.2}s",
+            domain_count,
+            Self::list_type_name(&list_type),
             elapsed.as_secs_f64()
         );
 
         Ok(())
     }
 
-    fn is_blacklisted(&self, domain: &str) -> bool {
-        self.check_domain(domain, ListType::Blacklist)
-    }
-
-    fn is_whitelisted(&self, domain: &str) -> bool {
-        self.check_domain(domain, ListType::Whitelist)
-    }
-
     fn check_domain(&self, domain: &str, list_type: ListType) -> bool {
         let domain_lower = domain.to_lowercase();
 
-        // Tier 1: Check cache
-        let cache = match list_type {
-            ListType::Blacklist => &self.blacklist_cache,
-            ListType::Whitelist => &self.whitelist_cache,
+        // Get appropriate cache, bloom filter, tree, and wildcard based on list type
+        let (cache, bloom, tree, wildcard) = match list_type {
+            ListType::Blacklist => (
+                &self.blacklist_cache,
+                &self.blacklist_bloom,
+                &self.blacklist_tree,
+                &self.blacklist_wildcard,
+            ),
+            ListType::Whitelist => (
+                &self.whitelist_cache,
+                &self.whitelist_bloom,
+                &self.whitelist_tree,
+                &self.whitelist_wildcard,
+            ),
         };
 
+        // Tier 1: Check cache
         if let Some(mut cache_guard) = cache.try_lock() {
             if let Some(&result) = cache_guard.get(&domain_lower) {
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return result;
             }
         }
-        // If we couldn't get the lock, we proceed without cache, which is fine.
-        // On miss, we still need to acquire lock to update.
 
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Tier 2: Check bloom filter (fast negative check)
-        let bloom = match list_type {
-            ListType::Blacklist => &self.blacklist_bloom,
-            ListType::Whitelist => &self.whitelist_bloom,
-        };
-
         if let Some(bloom_filter) = bloom {
             if !bloom_filter.check(&domain_lower.as_bytes().to_vec()) {
                 // Definitely not in the list
@@ -495,11 +510,6 @@ impl OptimizedDomainFilter {
         }
 
         // Tier 3: Check radix tree for exact match
-        let tree = match list_type {
-            ListType::Blacklist => &self.blacklist_tree,
-            ListType::Whitelist => &self.whitelist_tree,
-        };
-
         let tree_guard = tree.read();
         if tree_guard.contains(&domain_lower) {
             if let Some(mut cache_guard) = cache.try_lock() {
@@ -509,11 +519,6 @@ impl OptimizedDomainFilter {
         }
 
         // Tier 4: Check wildcard patterns
-        let wildcard = match list_type {
-            ListType::Blacklist => &self.blacklist_wildcard,
-            ListType::Whitelist => &self.whitelist_wildcard,
-        };
-
         if let Some(ac) = wildcard {
             if ac.find(&domain_lower).is_some() {
                 if let Some(mut cache_guard) = cache.try_lock() {
@@ -535,6 +540,14 @@ impl OptimizedDomainFilter {
         false
     }
 
+    fn is_blacklisted(&self, domain: &str) -> bool {
+        self.check_domain(domain, ListType::Blacklist)
+    }
+
+    fn is_whitelisted(&self, domain: &str) -> bool {
+        self.check_domain(domain, ListType::Whitelist)
+    }
+
     fn get_stats(&self) -> (usize, usize) {
         (
             self.stats.blacklist_domains.load(Ordering::Relaxed),
@@ -551,9 +564,18 @@ impl OptimizedDomainFilter {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ListType {
     Blacklist,
     Whitelist,
+}
+
+fn count_domains_in_tree(node: &RadixNode) -> usize {
+    let mut count = if node.is_end { 1 } else { 0 };
+    for child in node.children.values() {
+        count += count_domains_in_tree(child);
+    }
+    count
 }
 
 // Preprocessing utility for converting text lists to optimized binary format
@@ -802,6 +824,19 @@ struct ConnectionHandler {
 }
 
 impl ConnectionHandler {
+    fn log_disconnect(&self, addr: SocketAddr, reason: &str, disconnect_type: DisconnectType) {
+        match disconnect_type {
+            DisconnectType::Expected => {
+                trace!("Client {} disconnected (expected): {}", addr, reason);
+                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+            }
+            DisconnectType::Unexpected => {
+                debug!("Client {} disconnected (unexpected): {}", addr, reason);
+                self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     async fn handle_client(
         &self,
         mut client_stream: TcpStream,
@@ -820,7 +855,7 @@ impl ConnectionHandler {
         // Rate limiting
         if !self.rate_limiter.check_rate_limit(client_addr.ip()) {
             self.stats.rate_limited_connections.fetch_add(1, Ordering::Relaxed);
-            trace!("Rate limited connection from {}", client_addr);
+            debug!("Rate limited connection from {}", client_addr);
             return Err(ProxyError::RateLimited.into());
         }
 
@@ -843,24 +878,22 @@ impl ConnectionHandler {
         let n = match timeout(CLIENT_TIMEOUT, client_stream.read(&mut buffer)).await {
             Ok(Ok(n)) if n > 0 => n,
             Ok(Ok(_)) => {
-                trace!("Client {} closed connection", client_addr);
-                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                self.log_disconnect(client_addr, "graceful close", DisconnectType::Expected);
                 self.buffer_pool.put(buffer).await;
                 return Ok(());
             }
             Ok(Err(e)) if is_expected_error(&e) => {
-                trace!("Client {} disconnected: {}", client_addr, e);
-                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                self.log_disconnect(client_addr, &e.to_string(), DisconnectType::Expected);
                 self.buffer_pool.put(buffer).await;
                 return Ok(());
             }
             Ok(Err(e)) => {
-                debug!("Failed to read from client {}: {}", client_addr, e);
+                self.log_disconnect(client_addr, &e.to_string(), DisconnectType::Unexpected);
                 self.buffer_pool.put(buffer).await;
                 return Err(e.into());
             }
             Err(_) => {
-                trace!("Timeout reading from client {}", client_addr);
+                debug!("Client {} read timeout", client_addr);
                 self.buffer_pool.put(buffer).await;
                 return Err(ProxyError::Timeout.into());
             }
@@ -870,7 +903,7 @@ impl ConnectionHandler {
         let (method, host, port) = match parse_http_request(request_data) {
             Ok(data) => data,
             Err(e) => {
-                trace!("Invalid request from {}: {}", client_addr, e);
+                debug!("Invalid request from {}: {}", client_addr, e);
                 self.buffer_pool.put(buffer).await;
                 return Err(e);
             }
@@ -916,8 +949,7 @@ impl ConnectionHandler {
         if let Err(ref e) = result {
             if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                 if is_expected_error(io_err) {
-                    trace!("Expected disconnection for {}: {}", remote_addr, io_err);
-                    self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                    self.log_disconnect(client_addr, &io_err.to_string(), DisconnectType::Expected);
                     return Ok(());
                 }
             }
@@ -935,13 +967,13 @@ impl ConnectionHandler {
         let remote_stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(remote_addr)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                debug!("Failed to connect to {}: {}", remote_addr, e);
+                debug!("Failed to connect to remote {}: {}", remote_addr, e);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(ProxyError::Connection(format!("Failed to connect to {}", remote_addr)).into());
             }
             Err(_) => {
-                debug!("Timeout connecting to {}", remote_addr);
+                debug!("Connection timeout to remote {}", remote_addr);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream.write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n").await;
                 return Err(ProxyError::Timeout.into());
@@ -960,10 +992,11 @@ impl ConnectionHandler {
 
         if let Err(e) = client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
             if is_expected_error(&e) {
-                trace!("Client disconnected during CONNECT response");
+                trace!("Client disconnected during CONNECT response (expected): {}", e);
                 self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
+            debug!("Failed to send CONNECT response (unexpected): {}", e);
             return Err(e.into());
         }
 
@@ -985,7 +1018,7 @@ impl ConnectionHandler {
         let mut remote_stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(remote_addr)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                debug!("Failed to connect to {}: {}", remote_addr, e);
+                debug!("Failed to connect to remote {}: {}", remote_addr, e);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -993,7 +1026,7 @@ impl ConnectionHandler {
                 return Err(ProxyError::Connection(format!("Failed to connect to {}", remote_addr)).into());
             }
             Err(_) => {
-                debug!("Timeout connecting to {}", remote_addr);
+                debug!("Connection timeout to remote {}", remote_addr);
                 self.stats.failed_connections.fetch_add(1, Ordering::Relaxed);
                 let _ = client_stream
                     .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
@@ -1007,9 +1040,10 @@ impl ConnectionHandler {
 
         if let Err(e) = remote_stream.write_all(request_data).await {
             if is_expected_error(&e) {
-                trace!("Remote disconnected while sending request");
+                trace!("Remote disconnected while sending request (expected): {}", e);
                 return Ok(());
             }
+            debug!("Failed to send request to remote (unexpected): {}", e);
             return Err(e.into());
         }
 
@@ -1029,12 +1063,17 @@ impl ConnectionHandler {
             Ok(Ok(_)) => {
                 // Successfully read 5 bytes.
             }
+            Ok(Err(e)) if is_expected_error(&e) => {
+                trace!("Client disconnected before TLS handshake (expected): {}", e);
+                self.stats.client_disconnects.fetch_add(1, Ordering::Relaxed);
+                return Err(e.into());
+            }
             Ok(Err(e)) => {
-                // This is the key change: Log expected disconnects at TRACE level.
-                trace!("Client disconnected before sending TLS header (early eof): {}", e);
+                debug!("Failed to read TLS header (unexpected): {}", e);
                 return Err(e.into());
             }
             Err(_) => {
+                debug!("Timeout reading TLS header");
                 return Err(ProxyError::Timeout.into());
             }
         }
@@ -1073,6 +1112,7 @@ impl ConnectionHandler {
 
         self.pipe_connections_optimized(client_stream, remote_stream).await
     }
+
     async fn pipe_connections_optimized(&self, client: TcpStream, remote: TcpStream) -> Result<()> {
         let (client_read, client_write) = client.into_split();
         let (remote_read, remote_write) = remote.into_split();
@@ -1104,15 +1144,17 @@ impl ConnectionHandler {
 
         match (c2r_result, r2c_result) {
             (Ok(bytes_up), Ok(bytes_down)) => {
-                trace!("Connection closed: {}b up, {}b down", bytes_up, bytes_down);
+                trace!("Connection closed gracefully: {}b up, {}b down", bytes_up, bytes_down);
                 Ok(())
             }
             (Err(e), _) | (_, Err(e)) if is_expected_error(&e) => {
-                trace!("Connection closed: {}", e);
+                trace!("Connection closed (expected): {}", e);
                 Ok(())
             }
-            (Err(e), _) => Err(e.into()),
-            (_, Err(e)) => Err(e.into()),
+            (Err(e), _) | (_, Err(e)) => {
+                debug!("Connection error (unexpected): {}", e);
+                Err(e.into())
+            }
         }
     }
 }
@@ -1205,7 +1247,6 @@ fn parse_http_request(data: &[u8]) -> Result<(String, String, u16)> {
 
     Ok((method, host, port))
 }
-
 
 fn fragment_tls_data(data: &[u8]) -> Vec<Vec<u8>> {
     let mut fragments = Vec::new();
@@ -1454,17 +1495,20 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             if let Err(e) = handler.handle_client(stream, addr).await {
                                 match e.downcast_ref::<ProxyError>() {
-                                    Some(ProxyError::RateLimited) => {},
+                                    Some(ProxyError::RateLimited) => {
+                                        // Already logged at debug level
+                                    },
                                     Some(ProxyError::Timeout) => {
-                                        trace!("Connection timeout from {}", addr);
+                                        debug!("Connection timeout from {}", addr);
                                     },
                                     _ => {
                                         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                                             if !is_expected_error(io_err) {
-                                                debug!("Unexpected error handling client {}: {}", addr, e);
+                                                debug!("Unexpected connection error from {}: {}", addr, e);
                                             }
+                                            // Expected errors already logged at trace level
                                         } else {
-                                            debug!("Error handling client {}: {}", addr, e);
+                                            warn!("Non-IO error from {}: {}", addr, e);
                                         }
                                     }
                                 }
