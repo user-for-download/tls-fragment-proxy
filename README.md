@@ -97,9 +97,9 @@ example.com
 ### INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
 ```bash
 2025-09-24T07:39:45.119449Z  INFO Starting TLS Fragment Proxy v1.0.4
-2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: /home/ubuntu/git/dip/blacklist.bin
+2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: blacklist.bin
 2025-09-24T07:39:45.437229Z  INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
-2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: /home/ubuntu/git/dip/whitelist.bin
+2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: whitelist.bin
 2025-09-24T07:39:45.438570Z  INFO ✓ Loaded 89 domains from binary whitelist in 0.00s
 ```
 ## Architecture
@@ -119,11 +119,11 @@ Client → Proxy → [Domain Filter] → [TLS Fragmenter] → Remote Server
 ## Example
 
 ```bash
-[ubuntu@rust01]$ ./target/release/tls-fragment-proxy --port 8888 --host 0.0.0.0 --verbose --blacklist-binary /home/ubuntu/git/dip/blacklist.bin --whitelist-binary /home/ubuntu/git/dip/whitelist.bin --worker-threads 2
+[ubuntu@rust]$ ./target/release/tls-fragment-proxy --port 8888 --host 0.0.0.0 --verbose --blacklist-binary blacklist.bin --whitelist-binary whitelist.bin --worker-threads 2
 2025-09-24T07:39:45.119449Z  INFO Starting TLS Fragment Proxy v1.0.4
-2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: /home/ubuntu/git/dip/blacklist.bin
+2025-09-24T07:39:45.119612Z  INFO Loading binary blacklist from: blacklist.bin
 2025-09-24T07:39:45.437229Z  INFO ✓ Loaded 938471 domains from binary blacklist in 0.32s
-2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: /home/ubuntu/git/dip/whitelist.bin
+2025-09-24T07:39:45.438353Z  INFO Loading binary whitelist from: whitelist.bin
 2025-09-24T07:39:45.438570Z  INFO ✓ Loaded 89 domains from binary whitelist in 0.00s
 
 ╔══════════════════════════════════════════════════════╗

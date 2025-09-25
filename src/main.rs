@@ -24,8 +24,6 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 use bincode::{config};
-use memmap2::{Mmap, MmapOptions};
-use std::fs::File;
 use httparse;
 
 const VERSION: &str = "1.0.4";
@@ -247,10 +245,6 @@ struct OptimizedDomainFilter {
     blacklist_wildcard: Option<Arc<AhoCorasick>>,
     whitelist_wildcard: Option<Arc<AhoCorasick>>,
 
-    // Memory-mapped files for very large lists
-    blacklist_mmap: Option<Arc<Mmap>>,
-    whitelist_mmap: Option<Arc<Mmap>>,
-
     stats: DomainFilterStats,
 }
 
@@ -269,8 +263,6 @@ impl OptimizedDomainFilter {
             whitelist_tree: Arc::new(RwLock::new(RadixNode::new())),
             blacklist_wildcard: None,
             whitelist_wildcard: None,
-            blacklist_mmap: None,
-            whitelist_mmap: None,
             stats: DomainFilterStats::new(),
         };
 
@@ -328,6 +320,21 @@ impl OptimizedDomainFilter {
         }
     }
 
+    fn build_wildcard_automaton(wildcard_patterns: &[String]) -> Result<AhoCorasick> {
+        let patterns_iter = wildcard_patterns.iter().map(|p| {
+            if p.starts_with("*.") {
+                &p[2..]
+            } else {
+                p.as_str()
+            }
+        });
+
+        AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostFirst)
+            .build(patterns_iter)
+            .context("Failed to build Aho-Corasick automaton")
+    }
+
     async fn load_text_list(&mut self, path: &PathBuf, list_type: ListType) -> Result<()> {
         if !path.exists() {
             return Err(ProxyError::Configuration(
@@ -374,9 +381,6 @@ impl OptimizedDomainFilter {
             }
         }
 
-        let total_count = exact_domains.len() + wildcard_patterns.len();
-
-        // Build bloom filter for exact domains
         if !exact_domains.is_empty() {
             let mut bloom = Bloom::new_for_fp_rate(exact_domains.len(), BLOOM_FALSE_POSITIVE_RATE)
                 .map_err(|e| anyhow::anyhow!("Failed to create bloom filter: {}", e))?;
@@ -395,37 +399,25 @@ impl OptimizedDomainFilter {
         }
 
         // Update tree and stats using helper method
+        let total_count = exact_domains.len() + wildcard_patterns.len();
         self.update_tree_and_stats(tree, total_count, list_type);
 
         // Build Aho-Corasick automaton for wildcard patterns
         if !wildcard_patterns.is_empty() {
-            let patterns: Vec<String> = wildcard_patterns.iter()
-                .map(|p| {
-                    if p.starts_with("*.") {
-                        p[2..].to_string()
-                    } else {
-                        p.clone()
-                    }
-                })
-                .collect();
-
-            let ac = AhoCorasickBuilder::new()
-                .match_kind(MatchKind::LeftmostFirst)
-                .build(patterns)
-                .context("Failed to build Aho-Corasick automaton")?;
-
+            // --- REFACTORED: Use the new helper function ---
+            let ac = Self::build_wildcard_automaton(&wildcard_patterns)?;
             self.set_wildcard_automaton(ac, list_type);
         }
 
         let elapsed = start.elapsed();
         info!(
-            "✓ Loaded {} domains ({} exact, {} wildcard) from {} in {:.2}s",
-            total_count,
-            exact_domains.len(),
-            wildcard_patterns.len(),
-            Self::list_type_name(&list_type),
-            elapsed.as_secs_f64()
-        );
+        "✓ Loaded {} domains ({} exact, {} wildcard) from {} in {:.2}s",
+        total_count,
+        exact_domains.len(),
+        wildcard_patterns.len(),
+        Self::list_type_name(&list_type),
+        elapsed.as_secs_f64()
+    );
 
         Ok(())
     }
@@ -433,38 +425,49 @@ impl OptimizedDomainFilter {
     async fn load_binary_list(&mut self, path: &Path, list_type: ListType) -> Result<()> {
         let start = Instant::now();
 
-        // Try memory-mapped file for very large lists
-        if let Ok(file) = File::open(path) {
-            if file.metadata()?.len() > 100_000_000 { // > 100MB
-                let mmap = unsafe { MmapOptions::new().map(&file)? };
-                match list_type {
-                    ListType::Blacklist => self.blacklist_mmap = Some(Arc::new(mmap)),
-                    ListType::Whitelist => self.whitelist_mmap = Some(Arc::new(mmap)),
-                }
-                info!("Memory-mapped large binary file: {}", path.display());
-                return Ok(());
-            }
+        if !path.exists() {
+            return Err(ProxyError::Configuration(
+                format!("Binary list file not found: {}", path.display())
+            ).into());
         }
 
-        // Load binary data
-        let data = tokio::fs::read(path).await?;
+        let data = tokio::fs::read(path)
+            .await
+            .context(format!("Failed to read binary list file: {}", path.display()))?;
 
-        let (tree, _): (RadixNode, _) = bincode::serde::decode_from_slice(&data, config::standard())
-            .context("Failed to deserialize binary domain list")?;
+        let ((tree, wildcard_patterns), bytes_read): ((RadixNode, Vec<String>), usize) =
+            bincode::serde::decode_from_slice(&data, config::standard())
+                .context("Failed to deserialize binary domain list. The file might be outdated or corrupt. Please re-run with --preprocess-lists.")?;
 
-        // Count domains in the tree for statistics
-        let domain_count = count_domains_in_tree(&tree);
+        if bytes_read != data.len() {
+            warn!(
+            "Binary list file {} may have trailing data (read {} of {} bytes). The file could be corrupt.",
+            path.display(),
+            bytes_read,
+            data.len()
+        );
+        }
 
-        // Update tree and stats using helper method
-        self.update_tree_and_stats(tree, domain_count, list_type);
+        let exact_count = count_domains_in_tree(&tree);
+
+        if !wildcard_patterns.is_empty() {
+            // --- REFACTORED: Use the new helper function ---
+            let ac = Self::build_wildcard_automaton(&wildcard_patterns)?;
+            self.set_wildcard_automaton(ac, list_type);
+        }
+
+        let total_count = exact_count + wildcard_patterns.len();
+        self.update_tree_and_stats(tree, total_count, list_type);
 
         let elapsed = start.elapsed();
         info!(
-            "✓ Loaded {} domains from binary {} in {:.2}s",
-            domain_count,
-            Self::list_type_name(&list_type),
-            elapsed.as_secs_f64()
-        );
+        "✓ Loaded {} domains ({} exact, {} wildcard) from binary {} in {:.2}s",
+        total_count,
+        exact_count,
+        wildcard_patterns.len(),
+        Self::list_type_name(&list_type),
+        elapsed.as_secs_f64()
+    );
 
         Ok(())
     }
@@ -472,7 +475,6 @@ impl OptimizedDomainFilter {
     fn check_domain(&self, domain: &str, list_type: ListType) -> bool {
         let domain_lower = domain.to_lowercase();
 
-        // Get appropriate cache, bloom filter, tree, and wildcard based on list type
         let (cache, bloom, tree, wildcard) = match list_type {
             ListType::Blacklist => (
                 &self.blacklist_cache,
@@ -498,18 +500,11 @@ impl OptimizedDomainFilter {
 
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        // Tier 2: Check bloom filter (fast negative check)
         if let Some(bloom_filter) = bloom {
             if !bloom_filter.check(&domain_lower.as_bytes().to_vec()) {
-                // Definitely not in the list
-                if let Some(mut cache_guard) = cache.try_lock() {
-                    cache_guard.put(domain_lower.clone(), false);
-                }
-                return false;
             }
         }
 
-        // Tier 3: Check radix tree for exact match
         let tree_guard = tree.read();
         if tree_guard.contains(&domain_lower) {
             if let Some(mut cache_guard) = cache.try_lock() {
@@ -518,21 +513,18 @@ impl OptimizedDomainFilter {
             return true;
         }
 
-        // Tier 4: Check wildcard patterns
         if let Some(ac) = wildcard {
-            if ac.find(&domain_lower).is_some() {
-                if let Some(mut cache_guard) = cache.try_lock() {
-                    cache_guard.put(domain_lower.clone(), true);
+            for mat in ac.find_iter(&domain_lower) {
+                if mat.end() == domain_lower.len() {
+                    if mat.start() == 0 || domain_lower.as_bytes()[mat.start() - 1] == b'.' {
+                        if let Some(mut cache_guard) = cache.try_lock() {
+                            cache_guard.put(domain_lower.clone(), true);
+                        }
+                        return true;
+                    }
                 }
-                return true;
             }
         }
-
-        // Not found - update cache and check if bloom gave false positive
-        if bloom.is_some() {
-            self.stats.bloom_false_positives.fetch_add(1, Ordering::Relaxed);
-        }
-
         if let Some(mut cache_guard) = cache.try_lock() {
             cache_guard.put(domain_lower, false);
         }
@@ -585,40 +577,53 @@ async fn preprocess_domain_list(input: &Path, output: &Path) -> Result<()> {
     let start = Instant::now();
     let content = tokio::fs::read_to_string(input).await?;
 
-    // Parse domains
-    let domains: Vec<String> = content
+    // --- REWRITTEN FOR COMPILER STABILITY ---
+    // Step 1: Process all lines into a clean vector in parallel.
+    // This avoids a single, overly long chain of method calls that can confuse the compiler.
+    let lines: Vec<String> = content
         .par_lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| line.to_lowercase())
         .collect();
 
-    info!("Building radix tree from {} domains...", domains.len());
+    // Step 2: Partition the clean vector into exact domains and wildcard patterns.
+    let (exact_domains, wildcard_patterns): (Vec<String>, Vec<String>) = lines
+        .into_par_iter()
+        .partition(|line| !line.starts_with("*."));
 
-    // Build radix tree
+    info!(
+        "Building radix tree from {} exact domains and processing {} wildcard patterns...",
+        exact_domains.len(),
+        wildcard_patterns.len()
+    );
+
+    // Build radix tree from exact domains
     let mut tree = RadixNode::new();
-    for domain in &domains {
+    for domain in &exact_domains {
         tree.insert(domain);
     }
 
+    // The data to be serialized is a tuple containing both structures
+    let data_to_serialize = (tree, wildcard_patterns);
+
     // Serialize to binary
-    let encoded = bincode::serde::encode_to_vec(&tree, config::standard())?;
+    let encoded = bincode::serde::encode_to_vec(&data_to_serialize, config::standard())?;
 
     // Write to file
     tokio::fs::write(output, encoded).await?;
 
+    let total_domains = exact_domains.len() + data_to_serialize.1.len();
     let elapsed = start.elapsed();
     info!(
         "✓ Preprocessed {} domains in {:.2}s, output size: {}",
-        domains.len(),
+        total_domains,
         elapsed.as_secs_f64(),
         format_size(output.metadata()?.len(), BINARY)
     );
 
     Ok(())
 }
-
-// Buffer pool for memory reuse
 struct BufferPool {
     pool: Arc<tokio::sync::Mutex<Vec<BytesMut>>>,
     buffer_size: usize,
@@ -1249,14 +1254,23 @@ fn parse_http_request(data: &[u8]) -> Result<(String, String, u16)> {
 }
 
 fn fragment_tls_data(data: &[u8]) -> Vec<Vec<u8>> {
+
     let mut fragments = Vec::new();
 
-    if data.is_empty() {
-        return fragments;
+    // Example: Split into multiple smaller chunks
+    let chunk_sizes = [1, 5, 10]; // Configurable
+    let mut offset = 0;
+
+    for &size in &chunk_sizes {
+        if offset + size <= data.len() {
+            fragments.push(data[offset..offset + size].to_vec());
+            offset += size;
+        }
     }
 
-    fragments.push(data[..1].to_vec());
-    fragments.push(data[1..].to_vec());
+    if offset < data.len() {
+        fragments.push(data[offset..].to_vec());
+    }
 
     fragments
 }
@@ -1545,7 +1559,7 @@ async fn main() -> Result<()> {
 
     if !args.quiet {
         println!("\n╔══════════════════════════════════════════════════════╗");
-        println!("║                 \x1b[92mFINAL STATISTICS\x1b[0m                    ║");
+        println!("║                 \x1b[92mFINAL STATISTICS\x1b[0m                     ║");
         println!("╚══════════════════════════════════════════════════════╝\n");
 
         println!("  \x1b[97mTotal Connections:\x1b[0m      {}",
