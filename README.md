@@ -1,7 +1,3 @@
-Sure! Here's a comprehensive `README.md` for your project, covering its purpose, features, usage, configuration, and technical highlights based on the code you provided:
-
----
-
 # 🛡️ TLS Fragment Proxy
 
 **Version:** `1.1.0`
