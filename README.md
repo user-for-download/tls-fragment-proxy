@@ -183,17 +183,6 @@ Client ↔ Proxy (TLS Fragmentation + Filtering) ↔ Remote Server
                         └─ Aho-Corasick (wildcard match)
 ```
 
----
-
-## 🔒 TLS Fragmentation (Why?)
-
-Fragmentation bypasses DPI, censorship, or traffic shaping equipment by breaking the TLS ClientHello into smaller packets.
-
-- Reduces protocol fingerprinting
-- Increases resistance to SNI filtering
-
----
-
 ## 🏁 Graceful Shutdown
 
 The proxy supports `Ctrl+C` handling to flush final statistics and allow in-flight connections to complete before terminating.
@@ -203,21 +192,3 @@ The proxy supports `Ctrl+C` handling to flush final statistics and allow in-flig
 ## 📃 License
 
 **MIT**
-
----
-
-## 🤝 Contributing
-
-Contributions, bug reports, and feature requests are welcome!
-
-Please open an issue or PR on [GitHub](https://github.com/your-repo/tls-fragment-proxy).
-
----
-
-## 📫 Contact
-
-Built with ❤️ by Security & Performance enthusiasts.
-
----
-
-Let me know if you'd like this exported as an actual `README.md` file or want a version tailored toward users (vs. developers).
