@@ -1,0 +1,11 @@
+# =====================================
+# github
+# =====================================
+*.github.com
+*.github.io
+*.githubusercontent.com
+*.githubassets.com
+*.githubstatus.com
+*.github.dev
+*.codespaces.com
+*.githubcopilot.com
